@@ -23,6 +23,7 @@
 *.gcno
 *.gcda
 *.gcov
+.clangd
 
 # Binaries produced by this project
 hw2
