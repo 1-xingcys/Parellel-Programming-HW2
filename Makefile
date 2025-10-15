@@ -1,7 +1,7 @@
 # Makefile for hw2_sift project
 # Compiler and flags
 MPICXX = mpicxx
-MPIFLAGS = -std=c++17 -O3 -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp
+MPIFLAGS = -std=c++17 -O3 -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp
 INCLUDES = -I.
 
 # Source files
