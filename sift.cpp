@@ -4,11 +4,29 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <mpi.h>
+#include <omp.h>
 #include <tuple>
 #include <vector>
 
 #include "image.hpp"
 #include "sift.hpp"
+
+// MPI tag constants
+const int TAG_DOG_NUM_IMAGES = 1000;
+const int TAG_DOG_METADATA = 1;
+const int TAG_DOG_DATA = 2;
+const int TAG_KEYPOINT_COUNT = 0;
+const int TAG_KEYPOINT_INT_DATA = 1;
+const int TAG_KEYPOINT_FLOAT_DATA = 2;
+const int TAG_KEYPOINT_DESCRIPTOR = 3;
+const int TAG_GRAD_NUM_IMAGES = 500;
+const int TAG_GRAD_METADATA = 501;
+const int TAG_GRAD_DATA = 502;
+const int TAG_FINAL_KEYPOINT_COUNT = 100;
+const int TAG_FINAL_KEYPOINT_INT_DATA = 101;
+const int TAG_FINAL_KEYPOINT_FLOAT_DATA = 102;
+const int TAG_FINAL_KEYPOINT_DESCRIPTOR = 103;
 
 ScaleSpacePyramid generate_gaussian_pyramid(const Image &img, float sigma_min,
                                             int num_octaves,
@@ -55,19 +73,28 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image &img, float sigma_min,
 
 // generate pyramid of difference of gaussians (DoG) images
 ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid &img_pyramid) {
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
   ScaleSpacePyramid dog_pyramid = {
       img_pyramid.num_octaves, img_pyramid.imgs_per_octave - 1,
       std::vector<std::vector<Image>>(img_pyramid.num_octaves)};
-  for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+
+  // Each process only computes its assigned octaves
+  for (int i = rank; i < dog_pyramid.num_octaves; i += size) {
     dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
     for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
       Image diff = img_pyramid.octaves[i][j];
+#pragma omp simd
       for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
         diff.data[pix_idx] -= img_pyramid.octaves[i][j - 1].data[pix_idx];
       }
       dog_pyramid.octaves[i].push_back(diff);
     }
   }
+
+  // No gathering needed - each rank keeps only its assigned octaves
   return dog_pyramid;
 }
 
@@ -232,8 +259,8 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid &dog_pyramid,
     const std::vector<Image> &octave = dog_pyramid.octaves[i];
     for (int j = 1; j < dog_pyramid.imgs_per_octave - 1; j++) {
       const Image &img = octave[j];
-      for (int x = 1; x < img.width - 1; x++) {
-        for (int y = 1; y < img.height - 1; y++) {
+      for (int y = 1; y < img.height - 1; y++) {
+        for (int x = 1; x < img.width - 1; x++) {
           if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
             continue;
           }
@@ -254,31 +281,39 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid &dog_pyramid,
 
 // calculate x and y derivatives for all images in the input pyramid
 ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid &pyramid) {
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
   ScaleSpacePyramid grad_pyramid = {
       pyramid.num_octaves, pyramid.imgs_per_octave,
       std::vector<std::vector<Image>>(pyramid.num_octaves)};
-  for (int i = 0; i < pyramid.num_octaves; i++) {
+
+  // Each process only computes its assigned octaves
+  for (int i = rank; i < pyramid.num_octaves; i += size) {
     grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
     int width = pyramid.octaves[i][0].width;
     int height = pyramid.octaves[i][0].height;
     for (int j = 0; j < pyramid.imgs_per_octave; j++) {
       Image grad(width, height, 2);
-      float gx, gy;
-      for (int x = 1; x < grad.width - 1; x++) {
-        for (int y = 1; y < grad.height - 1; y++) {
-          gx = (pyramid.octaves[i][j].get_pixel(x + 1, y, 0) -
-                pyramid.octaves[i][j].get_pixel(x - 1, y, 0)) *
-               0.5;
+#pragma omp parallel for collapse(2)
+      for (int y = 1; y < grad.height - 1; y++) {
+        for (int x = 1; x < grad.width - 1; x++) {
+          float gx = (pyramid.octaves[i][j].get_pixel(x + 1, y, 0) -
+                      pyramid.octaves[i][j].get_pixel(x - 1, y, 0)) *
+                     0.5;
           grad.set_pixel(x, y, 0, gx);
-          gy = (pyramid.octaves[i][j].get_pixel(x, y + 1, 0) -
-                pyramid.octaves[i][j].get_pixel(x, y - 1, 0)) *
-               0.5;
+          float gy = (pyramid.octaves[i][j].get_pixel(x, y + 1, 0) -
+                      pyramid.octaves[i][j].get_pixel(x, y - 1, 0)) *
+                     0.5;
           grad.set_pixel(x, y, 1, gy);
         }
       }
       grad_pyramid.octaves[i].push_back(grad);
     }
   }
+
+  // No gathering needed - each rank keeps only its assigned octaves
   return grad_pyramid;
 }
 
@@ -286,11 +321,13 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid &pyramid) {
 void smooth_histogram(float hist[N_BINS]) {
   float tmp_hist[N_BINS];
   for (int i = 0; i < 6; i++) {
+#pragma omp simd
     for (int j = 0; j < N_BINS; j++) {
       int prev_idx = (j - 1 + N_BINS) % N_BINS;
       int next_idx = (j + 1) % N_BINS;
       tmp_hist[j] = (hist[prev_idx] + hist[j] + hist[next_idx]) / 3;
     }
+#pragma omp simd
     for (int j = 0; j < N_BINS; j++) {
       hist[j] = tmp_hist[j];
     }
@@ -322,8 +359,8 @@ find_keypoint_orientations(Keypoint &kp, const ScaleSpacePyramid &grad_pyramid,
   int y_end = std::round((kp.y + patch_radius) / pix_dist);
 
   // accumulate gradients in orientation histogram
-  for (int x = x_start; x <= x_end; x++) {
-    for (int y = y_start; y <= y_end; y++) {
+  for (int y = y_start; y <= y_end; y++) {
+    for (int x = x_start; x <= x_end; x++) {
       gx = img_grad.get_pixel(x, y, 0);
       gy = img_grad.get_pixel(x, y, 1);
       grad_norm = std::sqrt(gx * gx + gy * gy);
@@ -393,16 +430,19 @@ void hists_to_vec(float histograms[N_HIST][N_HIST][N_ORI],
   float *hist = reinterpret_cast<float *>(histograms);
 
   float norm = 0;
+#pragma omp simd reduction(+ : norm)
   for (int i = 0; i < size; i++) {
     norm += hist[i] * hist[i];
   }
   norm = std::sqrt(norm);
   float norm2 = 0;
+#pragma omp simd reduction(+ : norm2)
   for (int i = 0; i < size; i++) {
     hist[i] = std::min(hist[i], 0.2f * norm);
     norm2 += hist[i] * hist[i];
   }
   norm2 = std::sqrt(norm2);
+#pragma omp simd
   for (int i = 0; i < size; i++) {
     float val = std::floor(512 * hist[i] / norm2);
     feature_vec[i] = std::min((int)val, 255);
@@ -427,8 +467,8 @@ void compute_keypoint_descriptor(Keypoint &kp, float theta,
   float cos_t = std::cos(theta), sin_t = std::sin(theta);
   float patch_sigma = lambda_desc * kp.sigma;
   // accumulate samples into histograms
-  for (int m = x_start; m <= x_end; m++) {
-    for (int n = y_start; n <= y_end; n++) {
+  for (int n = y_start; n <= y_end; n++) {
+    for (int m = x_start; m <= x_end; m++) {
       // find normalized coords w.r.t. kp position and reference orientation
       float x =
           ((m * pix_dist - kp.x) * cos_t + (n * pix_dist - kp.y) * sin_t) /
@@ -466,30 +506,158 @@ find_keypoints_and_descriptors(const Image &img, float sigma_min,
                                float lambda_ori, float lambda_desc) {
   assert(img.channels == 1 || img.channels == 3);
 
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+  // All ranks compute gaussian pyramid independently (no broadcast needed)
   const Image &input = img.channels == 1 ? img : rgb_to_grayscale(img);
   ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(
       input, sigma_min, num_octaves, scales_per_octave);
+
+  // Each rank processes its assigned octaves
   ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-  std::vector<Keypoint> tmp_kps =
-      find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
   ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
 
   std::vector<Keypoint> kps;
 
-  for (Keypoint &kp_tmp : tmp_kps) {
-    std::vector<float> orientations = find_keypoint_orientations(
-        kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
-    for (float theta : orientations) {
-      Keypoint kp = kp_tmp;
-      compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
-      kps.push_back(kp);
+  // Each rank finds keypoints in its assigned octaves
+  for (int i = rank; i < dog_pyramid.num_octaves; i += size) {
+    const std::vector<Image> &octave = dog_pyramid.octaves[i];
+    for (int j = 1; j < dog_pyramid.imgs_per_octave - 1; j++) {
+      const Image &img = octave[j];
+
+      // Use OpenMP to parallelize the pixel scanning
+      std::vector<Keypoint> local_kps;
+
+#pragma omp parallel
+      {
+        // Each thread has its own local keypoint vector
+        std::vector<Keypoint> thread_kps;
+
+#pragma omp for collapse(2) schedule(dynamic)
+        for (int y = 1; y < img.height - 1; y++) {
+          for (int x = 1; x < img.width - 1; x++) {
+            if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
+              continue;
+            }
+            if (point_is_extremum(octave, j, x, y)) {
+              Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
+              bool kp_is_valid = refine_or_discard_keypoint(
+                  kp, octave, contrast_thresh, edge_thresh);
+              if (kp_is_valid) {
+                // Immediately compute orientations and descriptors
+                std::vector<float> orientations = find_keypoint_orientations(
+                    kp, grad_pyramid, lambda_ori, lambda_desc);
+                for (float theta : orientations) {
+                  Keypoint final_kp = kp;
+                  compute_keypoint_descriptor(final_kp, theta, grad_pyramid,
+                                              lambda_desc);
+                  thread_kps.push_back(final_kp);
+                }
+              }
+            }
+          }
+        }
+
+// Merge thread-local results into shared vector (critical section)
+#pragma omp critical
+        {
+          local_kps.insert(local_kps.end(), thread_kps.begin(),
+                           thread_kps.end());
+        }
+      }
+
+      // Add local keypoints to the main vector
+      kps.insert(kps.end(), local_kps.begin(), local_kps.end());
     }
   }
+
+  // Gather final keypoints to rank 0 - send all data at once
+  if (rank == 0) {
+    for (int src = 1; src < size; src++) {
+      int num_kps;
+      MPI_Recv(&num_kps, 1, MPI_INT, src, TAG_FINAL_KEYPOINT_COUNT,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+      if (num_kps > 0) {
+        // Allocate buffers for all keypoints at once
+        std::vector<int> int_data(num_kps * 4);
+        std::vector<float> float_data(num_kps * 4);
+        std::vector<uint8_t> descriptor_data(num_kps * 128);
+
+        // Receive all data in three bulk transfers
+        MPI_Recv(int_data.data(), num_kps * 4, MPI_INT, src,
+                 TAG_FINAL_KEYPOINT_INT_DATA, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+        MPI_Recv(float_data.data(), num_kps * 4, MPI_FLOAT, src,
+                 TAG_FINAL_KEYPOINT_FLOAT_DATA, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+        MPI_Recv(descriptor_data.data(), num_kps * 128, MPI_UNSIGNED_CHAR, src,
+                 TAG_FINAL_KEYPOINT_DESCRIPTOR, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+
+        // Reserve space for the keypoints to avoid reallocations
+        kps.reserve(kps.size() + num_kps);
+
+        // Unpack received data into keypoints
+        for (int k = 0; k < num_kps; k++) {
+          Keypoint kp;
+          kp.i = int_data[k * 4];
+          kp.j = int_data[k * 4 + 1];
+          kp.octave = int_data[k * 4 + 2];
+          kp.scale = int_data[k * 4 + 3];
+          kp.x = float_data[k * 4];
+          kp.y = float_data[k * 4 + 1];
+          kp.sigma = float_data[k * 4 + 2];
+          kp.extremum_val = float_data[k * 4 + 3];
+          std::copy(descriptor_data.begin() + k * 128,
+                    descriptor_data.begin() + (k + 1) * 128,
+                    kp.descriptor.begin());
+          kps.push_back(kp);
+        }
+      }
+    }
+  } else {
+    int num_kps = kps.size();
+    MPI_Send(&num_kps, 1, MPI_INT, 0, TAG_FINAL_KEYPOINT_COUNT, MPI_COMM_WORLD);
+
+    if (num_kps > 0) {
+      // Pack all keypoint data into contiguous buffers
+      std::vector<int> int_data(num_kps * 4);
+      std::vector<float> float_data(num_kps * 4);
+      std::vector<uint8_t> descriptor_data(num_kps * 128);
+
+      for (int k = 0; k < num_kps; k++) {
+        const Keypoint &kp = kps[k];
+        int_data[k * 4] = kp.i;
+        int_data[k * 4 + 1] = kp.j;
+        int_data[k * 4 + 2] = kp.octave;
+        int_data[k * 4 + 3] = kp.scale;
+        float_data[k * 4] = kp.x;
+        float_data[k * 4 + 1] = kp.y;
+        float_data[k * 4 + 2] = kp.sigma;
+        float_data[k * 4 + 3] = kp.extremum_val;
+        std::copy(kp.descriptor.begin(), kp.descriptor.end(),
+                  descriptor_data.begin() + k * 128);
+      }
+
+      // Send all data in three bulk transfers
+      MPI_Send(int_data.data(), num_kps * 4, MPI_INT, 0,
+               TAG_FINAL_KEYPOINT_INT_DATA, MPI_COMM_WORLD);
+      MPI_Send(float_data.data(), num_kps * 4, MPI_FLOAT, 0,
+               TAG_FINAL_KEYPOINT_FLOAT_DATA, MPI_COMM_WORLD);
+      MPI_Send(descriptor_data.data(), num_kps * 128, MPI_UNSIGNED_CHAR, 0,
+               TAG_FINAL_KEYPOINT_DESCRIPTOR, MPI_COMM_WORLD);
+    }
+  }
+
   return kps;
 }
 
 float euclidean_dist(std::array<uint8_t, 128> &a, std::array<uint8_t, 128> &b) {
   float dist = 0;
+#pragma omp simd reduction(+ : dist)
   for (int i = 0; i < 128; i++) {
     int di = (int)a[i] - b[i];
     dist += di * di;
@@ -502,7 +670,11 @@ Image draw_keypoints(const Image &img, const std::vector<Keypoint> &kps) {
   if (img.channels == 1) {
     res = grayscale_to_rgb(res);
   }
-  for (auto &kp : kps) {
+
+// Parallel keypoint drawing
+#pragma omp parallel for
+  for (size_t i = 0; i < kps.size(); ++i) {
+    const auto &kp = kps[i];
     draw_point(res, kp.x, kp.y, 5);
   }
   return res;

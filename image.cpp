@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <omp.h>
 #include <utility>
 
 #include "image.hpp"
@@ -21,8 +22,9 @@ Image::Image(std::string file_path) {
 
   size = width * height * channels;
   data = new float[size];
-  for (int x = 0; x < width; x++) {
-    for (int y = 0; y < height; y++) {
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
       for (int c = 0; c < channels; c++) {
         int src_idx = y * width * channels + x * channels + c;
         int dst_idx = c * height * width + y * width + x;
@@ -46,7 +48,8 @@ Image::~Image() { delete[] this->data; }
 Image::Image(const Image &other)
     : width{other.width}, height{other.height}, channels{other.channels},
       size{other.size}, data{new float[other.size]} {
-  // std::cout << "copy constructor\n";
+// std::cout << "copy constructor\n";
+#pragma omp simd
   for (int i = 0; i < size; i++)
     data[i] = other.data[i];
 }
@@ -60,6 +63,7 @@ Image &Image::operator=(const Image &other) {
     channels = other.channels;
     size = other.size;
     data = new float[other.size];
+#pragma omp simd
     for (int i = 0; i < other.size; i++)
       data[i] = other.data[i];
   }
@@ -91,8 +95,9 @@ Image &Image::operator=(Image &&other) {
 // save image as jpg file
 bool Image::save(std::string file_path) {
   unsigned char *out_data = new unsigned char[width * height * channels];
-  for (int x = 0; x < width; x++) {
-    for (int y = 0; y < height; y++) {
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
       for (int c = 0; c < channels; c++) {
         int dst_idx = y * width * channels + x * channels + c;
         int src_idx = c * height * width + y * width + x;
@@ -131,6 +136,7 @@ float Image::get_pixel(int x, int y, int c) const {
 
 void Image::clamp() {
   int size = width * height * channels;
+#pragma omp simd
   for (int i = 0; i < size; i++) {
     float val = data[i];
     val = (val > 1.0) ? 1.0 : val;
@@ -148,12 +154,13 @@ float map_coordinate(float new_max, float current_max, float coord) {
 
 Image Image::resize(int new_w, int new_h, Interpolation method) const {
   Image resized(new_w, new_h, this->channels);
-  float value = 0;
-  for (int x = 0; x < new_w; x++) {
-    for (int y = 0; y < new_h; y++) {
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < new_h; y++) {
+    for (int x = 0; x < new_w; x++) {
       for (int c = 0; c < resized.channels; c++) {
         float old_x = map_coordinate(this->width, new_w, x);
         float old_y = map_coordinate(this->height, new_h, y);
+        float value = 0;
         if (method == Interpolation::BILINEAR)
           value = bilinear_interpolate(*this, old_x, old_y, c);
         else if (method == Interpolation::NEAREST)
@@ -185,8 +192,9 @@ float nn_interpolate(const Image &img, float x, float y, int c) {
 Image rgb_to_grayscale(const Image &img) {
   assert(img.channels == 3);
   Image gray(img.width, img.height, 1);
-  for (int x = 0; x < img.width; x++) {
-    for (int y = 0; y < img.height; y++) {
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < img.height; y++) {
+    for (int x = 0; x < img.width; x++) {
       float red, green, blue;
       red = img.get_pixel(x, y, 0);
       green = img.get_pixel(x, y, 1);
@@ -200,8 +208,9 @@ Image rgb_to_grayscale(const Image &img) {
 Image grayscale_to_rgb(const Image &img) {
   assert(img.channels == 1);
   Image rgb(img.width, img.height, 3);
-  for (int x = 0; x < img.width; x++) {
-    for (int y = 0; y < img.height; y++) {
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < img.height; y++) {
+    for (int x = 0; x < img.width; x++) {
       float gray_val = img.get_pixel(x, y, 0);
       rgb.set_pixel(x, y, 0, gray_val);
       rgb.set_pixel(x, y, 1, gray_val);
@@ -226,15 +235,17 @@ Image gaussian_blur(const Image &img, float sigma) {
     kernel.set_pixel(center + k, 0, 0, val);
     sum += val;
   }
+#pragma omp simd
   for (int k = 0; k < size; k++)
     kernel.data[k] /= sum;
 
   Image tmp(img.width, img.height, 1);
   Image filtered(img.width, img.height, 1);
 
-  // convolve vertical
-  for (int x = 0; x < img.width; x++) {
-    for (int y = 0; y < img.height; y++) {
+// convolve vertical
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < img.height; y++) {
+    for (int x = 0; x < img.width; x++) {
       float sum = 0;
       for (int k = 0; k < size; k++) {
         int dy = -center + k;
@@ -243,9 +254,10 @@ Image gaussian_blur(const Image &img, float sigma) {
       tmp.set_pixel(x, y, 0, sum);
     }
   }
-  // convolve horizontal
-  for (int x = 0; x < img.width; x++) {
-    for (int y = 0; y < img.height; y++) {
+// convolve horizontal
+#pragma omp parallel for collapse(2)
+  for (int y = 0; y < img.height; y++) {
+    for (int x = 0; x < img.width; x++) {
       float sum = 0;
       for (int k = 0; k < size; k++) {
         int dx = -center + k;

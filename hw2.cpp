@@ -2,18 +2,27 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mpi.h>
 #include <string>
 
 #include "image.hpp"
 #include "sift.hpp"
 
 int main(int argc, char *argv[]) {
+  MPI_Init(&argc, &argv);
+
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
   std::ios_base::sync_with_stdio(false);
   std::cin.tie(NULL);
 
   if (argc != 4) {
-    std::cerr << "Usage: ./hw2 ./testcases/xx.jpg ./results/xx.jpg "
-                 "./results/xx.txt\n";
+    if (rank == 0) {
+      std::cerr << "Usage: ./hw2 ./testcases/xx.jpg ./results/xx.jpg "
+                   "./results/xx.txt\n";
+    }
+    MPI_Finalize();
     return 1;
   }
 
@@ -28,33 +37,39 @@ int main(int argc, char *argv[]) {
 
   std::vector<Keypoint> kps = find_keypoints_and_descriptors(img);
 
-  /////////////////////////////////////////////////////////////
-  // The following code is for the validation
-  // You can not change the logic of the following code, because it is used for
-  // judge system
-  std::ofstream ofs(output_txt);
-  if (!ofs) {
-    std::cerr << "Failed to open " << output_txt << " for writing.\n";
-  } else {
-    ofs << kps.size() << "\n";
-    for (const auto &kp : kps) {
-      ofs << kp.i << " " << kp.j << " " << kp.octave << " " << kp.scale << " ";
-      for (size_t i = 0; i < kp.descriptor.size(); ++i) {
-        ofs << " " << static_cast<int>(kp.descriptor[i]);
+  // Only rank 0 performs I/O operations
+  if (rank == 0) {
+    /////////////////////////////////////////////////////////////
+    // The following code is for the validation
+    // You can not change the logic of the following code, because it is used
+    // for judge system
+    std::ofstream ofs(output_txt);
+    if (!ofs) {
+      std::cerr << "Failed to open " << output_txt << " for writing.\n";
+    } else {
+      ofs << kps.size() << "\n";
+      for (const auto &kp : kps) {
+        ofs << kp.i << " " << kp.j << " " << kp.octave << " " << kp.scale
+            << " ";
+        for (size_t i = 0; i < kp.descriptor.size(); ++i) {
+          ofs << " " << static_cast<int>(kp.descriptor[i]);
+        }
+        ofs << "\n";
       }
-      ofs << "\n";
+      ofs.close();
     }
-    ofs.close();
+
+    Image result = draw_keypoints(img, kps);
+    result.save(output_img);
+    /////////////////////////////////////////////////////////////
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration = end - start;
+    std::cout << "Execution time: " << duration.count() << " ms\n";
+
+    std::cout << "Found " << kps.size() << " keypoints.\n";
   }
 
-  Image result = draw_keypoints(img, kps);
-  result.save(output_img);
-  /////////////////////////////////////////////////////////////
-
-  auto end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double, std::milli> duration = end - start;
-  std::cout << "Execution time: " << duration.count() << " ms\n";
-
-  std::cout << "Found " << kps.size() << " keypoints.\n";
+  MPI_Finalize();
   return 0;
 }
