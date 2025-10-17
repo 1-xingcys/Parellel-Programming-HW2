@@ -254,8 +254,12 @@ bool refine_or_discard_keypoint(Keypoint &kp, const std::vector<Image> &octave,
 
 std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid &dog_pyramid,
                                      float contrast_thresh, float edge_thresh) {
+  int rank, size;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
   std::vector<Keypoint> keypoints;
-  for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+  for (int i = rank; i < dog_pyramid.num_octaves; i += size) {
     const std::vector<Image> &octave = dog_pyramid.octaves[i];
     for (int j = 1; j < dog_pyramid.imgs_per_octave - 1; j++) {
       const Image &img = octave[j];
@@ -517,60 +521,28 @@ find_keypoints_and_descriptors(const Image &img, float sigma_min,
 
   // Each rank processes its assigned octaves
   ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
+  std::vector<Keypoint> tmp_kps =
+      find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
   ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
 
   std::vector<Keypoint> kps;
 
-  // Each rank finds keypoints in its assigned octaves
-  for (int i = rank; i < dog_pyramid.num_octaves; i += size) {
-    const std::vector<Image> &octave = dog_pyramid.octaves[i];
-    for (int j = 1; j < dog_pyramid.imgs_per_octave - 1; j++) {
-      const Image &img = octave[j];
-
-      // Use OpenMP to parallelize the pixel scanning
-      std::vector<Keypoint> local_kps;
-
 #pragma omp parallel
-      {
-        // Each thread has its own local keypoint vector
-        std::vector<Keypoint> thread_kps;
-
-#pragma omp for collapse(2) schedule(dynamic)
-        for (int y = 1; y < img.height - 1; y++) {
-          for (int x = 1; x < img.width - 1; x++) {
-            if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
-              continue;
-            }
-            if (point_is_extremum(octave, j, x, y)) {
-              Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
-              bool kp_is_valid = refine_or_discard_keypoint(
-                  kp, octave, contrast_thresh, edge_thresh);
-              if (kp_is_valid) {
-                // Immediately compute orientations and descriptors
-                std::vector<float> orientations = find_keypoint_orientations(
-                    kp, grad_pyramid, lambda_ori, lambda_desc);
-                for (float theta : orientations) {
-                  Keypoint final_kp = kp;
-                  compute_keypoint_descriptor(final_kp, theta, grad_pyramid,
-                                              lambda_desc);
-                  thread_kps.push_back(final_kp);
-                }
-              }
-            }
-          }
-        }
-
-// Merge thread-local results into shared vector (critical section)
-#pragma omp critical
-        {
-          local_kps.insert(local_kps.end(), thread_kps.begin(),
-                           thread_kps.end());
-        }
+  {
+    std::vector<Keypoint> local_kps;
+#pragma omp for
+    for (size_t i = 0; i < tmp_kps.size(); ++i) {
+      Keypoint kp_tmp = tmp_kps[i]; // Work on a copy
+      std::vector<float> orientations = find_keypoint_orientations(
+          kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
+      for (float theta : orientations) {
+        Keypoint kp = kp_tmp;
+        compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
+        local_kps.push_back(kp);
       }
-
-      // Add local keypoints to the main vector
-      kps.insert(kps.end(), local_kps.begin(), local_kps.end());
     }
+#pragma omp critical
+    { kps.insert(kps.end(), local_kps.begin(), local_kps.end()); }
   }
 
   // Gather final keypoints to rank 0 - send all data at once
