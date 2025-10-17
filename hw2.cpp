@@ -4,7 +4,7 @@
 #include <iostream>
 #include <mpi.h>
 #include <string>
-
+#include <sstream>
 #include "image.hpp"
 #include "sift.hpp"
 
@@ -48,13 +48,17 @@ int main(int argc, char *argv[]) {
       std::cerr << "Failed to open " << output_txt << " for writing.\n";
     } else {
       ofs << kps.size() << "\n";
-      for (const auto &kp : kps) {
-        ofs << kp.i << " " << kp.j << " " << kp.octave << " " << kp.scale
-            << " ";
-        for (size_t i = 0; i < kp.descriptor.size(); ++i) {
-          ofs << " " << static_cast<int>(kp.descriptor[i]);
+#pragma omp parallel for
+      for (size_t i = 0; i < kps.size(); ++i) {
+        const auto &kp = kps[i];
+        std::stringstream ss;
+        ss << kp.i << " " << kp.j << " " << kp.octave << " " << kp.scale;
+        for (size_t j = 0; j < kp.descriptor.size(); ++j) {
+          ss << " " << static_cast<int>(kp.descriptor[j]);
         }
-        ofs << "\n";
+        ss << "\n";
+#pragma omp critical
+        { ofs << ss.str(); }
       }
       ofs.close();
     }
