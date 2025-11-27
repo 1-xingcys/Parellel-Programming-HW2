@@ -60,3 +60,6 @@ pyvenv.cfg
 # Common venv subfolders without ignoring system-wide lib/include
 lib/python*/
 include/python*/
+
+
+b10705009*
